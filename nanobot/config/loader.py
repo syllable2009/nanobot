@@ -22,6 +22,7 @@ def get_config_path() -> Path:
     """Get the configuration file path."""
     if _current_config_path:
         return _current_config_path
+    # Path.home()=自动获取你当前用户的home目录，在 Mac 上 = /Users/你的用户名
     return Path.home() / ".nanobot" / "config.json"
 
 

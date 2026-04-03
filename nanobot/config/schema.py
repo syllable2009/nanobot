@@ -7,7 +7,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
-
+# 继承 BaseModel = 让你的类变成「超级数据模型」自动获得 Pydantic 能力
+# 1. 自动数据类型验证（最核心）
+# 2. 支持 JSON ↔ 对象 自动转换
+# 3. 支持别名（camelCase ↔ snake_case 自动互转）
 class Base(BaseModel):
     """Base model that accepts both camelCase and snake_case keys."""
 

@@ -38,10 +38,15 @@ from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
 from nanobot.utils.helpers import sync_workspace_templates
 
+# typer.Typer () = 创建一个命令行工具
 app = typer.Typer(
+    # 定义命令的名字，对应终端的名字
     name="nanobot",
+    # 设置帮助命令，两个都能打开帮助
     context_settings={"help_option_names": ["-h", "--help"]},
+    # 输入 nanobot --help 时显示的标题 / 介绍，会显示 LOGO + 说明文字
     help=f"{__logo__} nanobot - Personal AI Assistant",
+    # 如果你只输入 nanobot，不加任何子命令，自动显示帮助文档，而不是报错
     no_args_is_help=True,
 )
 
@@ -246,7 +251,7 @@ def main(
 # Onboard / Setup
 # ============================================================================
 
-
+# nanobot onboard --workspace ./my-workspace -c ./config.toml --wizard
 @app.command()
 def onboard(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
@@ -264,6 +269,7 @@ def onboard(
     else:
         config_path = get_config_path()
 
+    # 内部函数 / 嵌套函数，完全合法。这个函数只在这个方法里面用更干净、不污染外部，可以直接访问外层函数的变量
     def _apply_workspace_override(loaded: Config) -> Config:
         if workspace:
             loaded.agents.defaults.workspace = workspace
@@ -292,7 +298,7 @@ def onboard(
             save_config(config, config_path)
             console.print(f"[green]✓[/green] Created config at {config_path}")
 
-    # Run interactive wizard if enabled
+    # 支持交互式向导（--wizard）
     if wizard:
         from nanobot.cli.onboard import run_onboard
 
