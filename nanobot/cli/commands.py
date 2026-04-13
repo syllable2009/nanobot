@@ -814,7 +814,281 @@ def agent(
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
-    """Interact with the agent directly."""
+    """
+    与智能体直接交互的入口命令。
+    
+    支持两种运行模式：
+    1. 单消息模式（提供 -m 参数）：发送一条消息并等待响应后退出
+    2. 交互模式（不提供 -m 参数）：进入交互式对话循环，可持续与智能体对话
+    
+    执行流程：
+    1. 加载配置和工作区模板
+    2. 初始化核心组件（消息总线、AI提供者、定时任务服务）
+    3. 创建智能体循环实例
+    4. 根据是否有消息参数，选择单次执行或交互模式
+    """
+    from loguru import logger
+
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.cron.service import CronService
+
+    # ========== 第1步：加载配置和初始化工作区 ==========
+    # 加载运行时配置，确定工作区路径
+    config = _load_runtime_config(config, workspace)
+    # 同步工作区模板文件（如 AGENTS.md, SOUL.md 等）
+    sync_workspace_templates(config.workspace_path)
+
+    # ========== 第2步：初始化核心组件 ==========
+    # 创建消息总线，用于组件间通信
+    bus = MessageBus()
+    # 根据配置创建 AI 模型提供者（OpenAI、Anthropic 等）
+    provider = _make_provider(config)
+
+    # 迁移定时任务存储（仅针对默认工作区）
+    if is_default_workspace(config.workspace_path):
+        _migrate_cron_store(config)
+
+    # 创建定时任务服务，使用工作区作用域的存储路径
+    cron_store_path = config.workspace_path / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
+    # 根据用户选项控制日志输出
+    if logs:
+        logger.enable("nanobot")
+    else:
+        logger.disable("nanobot")
+
+    # ========== 第3步：创建智能体循环实例 ==========
+    # AgentLoop 是核心引擎，负责处理消息、调用工具、管理上下文等
+    agent_loop = AgentLoop(
+        bus=bus,                                          # 消息总线
+        provider=provider,                                # AI 模型提供者
+        workspace=config.workspace_path,                  # 工作区路径
+        model=config.agents.defaults.model,               # 使用的模型名称
+        max_iterations=config.agents.defaults.max_tool_iterations,  # 最大工具调用迭代次数
+        context_window_tokens=config.agents.defaults.context_window_tokens,  # 上下文窗口大小
+        context_block_limit=config.agents.defaults.context_block_limit,  # 上下文块限制
+        max_tool_result_chars=config.agents.defaults.max_tool_result_chars,  # 工具结果最大字符数
+        provider_retry_mode=config.agents.defaults.provider_retry_mode,  # 提供者重试模式
+        web_search_config=config.tools.web.search,        # 网络搜索配置
+        web_proxy=config.tools.web.proxy or None,         # 网络代理
+        exec_config=config.tools.exec,                    # 执行工具配置
+        cron_service=cron,                                # 定时任务服务
+        restrict_to_workspace=config.tools.restrict_to_workspace,  # 是否限制在工作区内
+        mcp_servers=config.tools.mcp_servers,             # MCP 服务器配置
+        channels_config=config.channels,                  # 渠道配置
+        timezone=config.agents.defaults.timezone,         # 时区设置
+    )
+
+    # 用于进度回调的共享变量（思考旋转器）
+    _thinking: ThinkingSpinner | None = None
+
+    # 定义 CLI 进度回调函数，用于显示工具执行进度
+    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
+        ch = agent_loop.channels_config
+        # 根据配置决定是否显示工具提示和进度信息
+        if ch and tool_hint and not ch.send_tool_hints:
+            return
+        if ch and not tool_hint and not ch.send_progress:
+            return
+        _print_cli_progress_line(content, _thinking)
+
+    # ========== 第4步：根据运行模式执行 ==========
+    if message:
+        # ===== 模式A：单消息模式 =====
+        # 用户提供了消息参数，直接处理该消息后退出
+        async def run_once():
+            # 创建流式渲染器，用于处理流式响应
+            renderer = StreamRenderer(render_markdown=markdown)
+            # 直接处理消息（不经过消息总线）
+            response = await agent_loop.process_direct(
+                message, session_id,
+                on_progress=_cli_progress,      # 进度回调
+                on_stream=renderer.on_delta,    # 流式数据块回调
+                on_stream_end=renderer.on_end,  # 流式结束回调
+            )
+            # 如果没有流式输出，则打印完整响应
+            if not renderer.streamed:
+                await renderer.close()
+                _print_agent_response(
+                    response.content if response else "",
+                    render_markdown=markdown,
+                    metadata=response.metadata if response else None,
+                )
+            # 关闭 MCP 连接
+            await agent_loop.close_mcp()
+
+        # 运行单次异步任务
+        asyncio.run(run_once())
+    else:
+        # ===== 模式B：交互模式 =====
+        # 用户未提供消息，进入交互式对话循环
+        from nanobot.bus.events import InboundMessage
+        # 初始化提示词会话（用于命令行补全等）
+        _init_prompt_session()
+        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+
+        # 解析会话ID，格式为 "channel:chat_id" 或单独的 "chat_id"
+        if ":" in session_id:
+            cli_channel, cli_chat_id = session_id.split(":", 1)
+        else:
+            cli_channel, cli_chat_id = "cli", session_id
+
+        # 注册信号处理器，优雅处理中断信号
+        def _handle_signal(signum, frame):
+            sig_name = signal.Signals(signum).name
+            _restore_terminal()
+            console.print(f"\nReceived {sig_name}, goodbye!")
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, _handle_signal)   # Ctrl+C
+        signal.signal(signal.SIGTERM, _handle_signal)  # 终止信号
+        # SIGHUP 在 Windows 上不可用
+        if hasattr(signal, 'SIGHUP'):
+            signal.signal(signal.SIGHUP, _handle_signal)
+        # 忽略 SIGPIPE，防止写入关闭的管道时进程静默终止
+        if hasattr(signal, 'SIGPIPE'):
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+        async def run_interactive():
+            # 启动智能体循环后台任务
+            bus_task = asyncio.create_task(agent_loop.run())
+            # 用于等待每轮对话完成的事件
+            turn_done = asyncio.Event()
+            turn_done.set()
+            # 存储当前轮的响应内容
+            turn_response: list[tuple[str, dict]] = []
+            # 流式渲染器
+            renderer: StreamRenderer | None = None
+
+            # 定义 outbound 消息消费者，处理来自智能体的响应
+            async def _consume_outbound():
+                while True:
+                    try:
+                        # 从消息总线消费出站消息（超时1秒，避免阻塞）
+                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+                        # 处理流式数据块
+                        if msg.metadata.get("_stream_delta"):
+                            if renderer:
+                                await renderer.on_delta(msg.content)
+                            continue
+                        # 处理流式结束
+                        if msg.metadata.get("_stream_end"):
+                            if renderer:
+                                await renderer.on_end(
+                                    resuming=msg.metadata.get("_resuming", False),
+                                )
+                            continue
+                        # 处理流式标记
+                        if msg.metadata.get("_streamed"):
+                            turn_done.set()
+                            continue
+
+                        # 处理进度消息
+                        if msg.metadata.get("_progress"):
+                            is_tool_hint = msg.metadata.get("_tool_hint", False)
+                            ch = agent_loop.channels_config
+                            # 根据配置决定是否显示
+                            if ch and is_tool_hint and not ch.send_tool_hints:
+                                pass
+                            elif ch and not is_tool_hint and not ch.send_progress:
+                                pass
+                            else:
+                                await _print_interactive_progress_line(msg.content, _thinking)
+                            continue
+
+                        # 处理普通响应消息
+                        if not turn_done.is_set():
+                            # 第一轮响应，保存到 turn_response
+                            if msg.content:
+                                turn_response.append((msg.content, dict(msg.metadata or {})))
+                            turn_done.set()
+                        elif msg.content:
+                            # 后续响应，直接打印
+                            await _print_interactive_response(
+                                msg.content,
+                                render_markdown=markdown,
+                                metadata=msg.metadata,
+                            )
+
+                    except asyncio.TimeoutError:
+                        # 超时是正常的，继续循环
+                        continue
+                    except asyncio.CancelledError:
+                        # 任务被取消，退出循环
+                        break
+
+            # 启动 outbound 消息消费任务
+            outbound_task = asyncio.create_task(_consume_outbound())
+
+            try:
+                # ===== 主交互循环 =====
+                while True:
+                    try:
+                        # 刷新待处理的 TTY 输入
+                        _flush_pending_tty_input()
+                        # 异步读取用户输入
+                        user_input = await _read_interactive_input_async()
+                        command = user_input.strip()
+                        if not command:
+                            continue
+
+                        # 检查是否为退出命令
+                        if _is_exit_command(command):
+                            _restore_terminal()
+                            console.print("\nGoodbye!")
+                            break
+
+                        # 重置本轮状态
+                        turn_done.clear()
+                        turn_response.clear()
+                        renderer = StreamRenderer(render_markdown=markdown)
+
+                        # 通过消息总线发布用户消息
+                        await bus.publish_inbound(InboundMessage(
+                            channel=cli_channel,
+                            sender_id="user",
+                            chat_id=cli_chat_id,
+                            content=user_input,
+                            metadata={"_wants_stream": True},  # 标记需要流式输出
+                        ))
+
+                        # 等待本轮对话完成
+                        await turn_done.wait()
+
+                        # 如果有非流式响应，则打印
+                        if turn_response:
+                            content, meta = turn_response[0]
+                            if content and not meta.get("_streamed"):
+                                if renderer:
+                                    await renderer.close()
+                                _print_agent_response(
+                                    content, render_markdown=markdown, metadata=meta,
+                                )
+                        elif renderer and not renderer.streamed:
+                            # 如果渲染器没有流式输出，关闭它
+                            await renderer.close()
+                    except KeyboardInterrupt:
+                        # 处理键盘中断
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+                    except EOFError:
+                        # 处理文件结束（如管道输入结束）
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+            finally:
+                # 清理资源：停止智能体循环，取消任务，关闭 MCP
+                agent_loop.stop()
+                outbound_task.cancel()
+                await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
+                await agent_loop.close_mcp()
+
+        # 运行交互式异步任务
+        asyncio.run(run_interactive())y."""
     from loguru import logger
 
     from nanobot.agent.loop import AgentLoop
